@@ -19,13 +19,13 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"golang.org/x/exp/slices"
+	"golang.org/x/sync/semaphore"
 
 	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/gpu"
@@ -54,7 +54,7 @@ func init() {
 }
 
 var loaded struct {
-	mu sync.Mutex
+	capacity *semaphore.Weighted
 
 	llama *llm.LlamaServer
 
@@ -80,11 +80,10 @@ func unload() {
 	loaded.Options = nil
 }
 
-// load a model into memory if it is not already loaded, it is up to the caller to lock loaded.mu before calling this function
+// load a model into memory if it is not already loaded
 func load(c *gin.Context, model *Model, opts api.Options, sessionDuration time.Duration) error {
 	ctx, cancel := context.WithTimeout(c, 10*time.Second)
 	defer cancel()
-
 	needLoad := loaded.llama == nil || // is there a model loaded?
 		loaded.model != model.ModelPath || // has the base model changed?
 		!reflect.DeepEqual(loaded.adapters, model.AdapterPaths) || // have the adapters changed?
@@ -93,6 +92,10 @@ func load(c *gin.Context, model *Model, opts api.Options, sessionDuration time.D
 		loaded.llama.Ping(ctx) != nil
 
 	if needLoad {
+		if loaded.capacity != nil {
+			loaded.capacity.Acquire(c, int64(loaded.Options.Parallel))
+			defer loaded.capacity.Release(int64(loaded.Options.Parallel))
+		}
 		if loaded.llama != nil {
 			slog.Info("changing loaded model")
 			unload()
@@ -121,12 +124,14 @@ func load(c *gin.Context, model *Model, opts api.Options, sessionDuration time.D
 			unload()
 			return err
 		}
+
+		loaded.capacity = semaphore.NewWeighted(int64(loaded.Options.Parallel))
 	}
 
 	if loaded.expireTimer == nil {
 		loaded.expireTimer = time.AfterFunc(sessionDuration, func() {
-			loaded.mu.Lock()
-			defer loaded.mu.Unlock()
+			loaded.capacity.Acquire(context.Background(), int64(loaded.Options.Parallel))
+			defer loaded.capacity.Release(int64(loaded.Options.Parallel))
 			unload()
 		})
 	}
@@ -155,8 +160,6 @@ func isSupportedImageType(image []byte) bool {
 }
 
 func GenerateHandler(c *gin.Context) {
-	loaded.mu.Lock()
-	defer loaded.mu.Unlock()
 
 	checkpointStart := time.Now()
 	var req api.GenerateRequest
@@ -228,6 +231,8 @@ func GenerateHandler(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	loaded.capacity.Acquire(c, 1)
+	defer loaded.capacity.Release(1)
 
 	// an empty request loads the model
 	// note: for a short while template was used in lieu
@@ -422,8 +427,6 @@ func getDefaultSessionDuration() time.Duration {
 }
 
 func EmbeddingsHandler(c *gin.Context) {
-	loaded.mu.Lock()
-	defer loaded.mu.Unlock()
 
 	var req api.EmbeddingRequest
 	err := c.ShouldBindJSON(&req)
@@ -474,6 +477,8 @@ func EmbeddingsHandler(c *gin.Context) {
 		return
 	}
 
+	loaded.capacity.Acquire(c, 1)
+	defer loaded.capacity.Release(1)
 	// an empty request loads the model
 	if req.Prompt == "" {
 		c.JSON(http.StatusOK, api.EmbeddingResponse{Embedding: []float64{}})
@@ -1233,8 +1238,6 @@ func chatPrompt(ctx context.Context, template string, messages []api.Message, nu
 }
 
 func ChatHandler(c *gin.Context) {
-	loaded.mu.Lock()
-	defer loaded.mu.Unlock()
 
 	checkpointStart := time.Now()
 
@@ -1296,6 +1299,9 @@ func ChatHandler(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+
+	loaded.capacity.Acquire(c, 1)
+	defer loaded.capacity.Release(1)
 
 	checkpointLoaded := time.Now()
 

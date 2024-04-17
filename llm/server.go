@@ -211,6 +211,9 @@ func NewLlamaServer(model string, adapters, projectors []string, opts api.Option
 	if opts.UseNUMA {
 		params = append(params, "--numa")
 	}
+	if opts.Parallel > 1 {
+		params = append(params, "--cont-batching", "--parallel", fmt.Sprintf("%d", opts.Parallel))
+	}
 
 	// Loop through potential servers
 	var finalErr error
