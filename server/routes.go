@@ -94,7 +94,6 @@ func load(c *gin.Context, model *Model, opts api.Options, sessionDuration time.D
 	if needLoad {
 		if loaded.capacity != nil {
 			loaded.capacity.Acquire(c, int64(loaded.Options.Parallel))
-			defer loaded.capacity.Release(int64(loaded.Options.Parallel))
 		}
 		if loaded.llama != nil {
 			slog.Info("changing loaded model")
@@ -109,7 +108,7 @@ func load(c *gin.Context, model *Model, opts api.Options, sessionDuration time.D
 			if errors.Is(llm.ErrUnsupportedFormat, err) || strings.Contains(err.Error(), "failed to load model") {
 				err = fmt.Errorf("%v: this model may be incompatible with your version of Ollama. If you previously pulled this model, try updating it by running `ollama pull %s`", err, model.ShortName)
 			}
-
+			defer loaded.capacity.Release(int64(loaded.Options.Parallel))
 			return err
 		}
 
@@ -122,6 +121,7 @@ func load(c *gin.Context, model *Model, opts api.Options, sessionDuration time.D
 		if err = llama.WaitUntilRunning(); err != nil {
 			slog.Error("error loading llama server", "error", err)
 			unload()
+			defer loaded.capacity.Release(int64(loaded.Options.Parallel))
 			return err
 		}
 
